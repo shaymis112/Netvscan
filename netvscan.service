@@ -1,0 +1,21 @@
+[Unit]
+Description=NetVScan Background Security Scanner
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/netvscan
+Restart=always
+# Lower CPU and Disk priority so it doesn't slow down your desktop
+Nice=19
+IOSchedulingClass=idle
+# The script handles its own 10-minute interval; restart quickly only if it crashes
+RestartSec=5
+StandardOutput=append:%h/.local/share/netvscan.log
+StandardError=append:%h/.local/share/netvscan.log
+
+# Required to show the Zenity password popup on your desktop
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+[Install]
+WantedBy=default.target

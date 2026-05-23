@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+
+# Exit on unset variables and ensure pipe failures are captured
+set -uo pipefail
+
+# --- Dependencies ---
+# To run this script, you need the following packages installed:
+# 1. clamav          - The antivirus engine (provides 'clamscan')(and 'freshclam' for database updates)  
+# 2. libnotify-bin   - For desktop pop-up notifications (provides 'notify-send')
+# 3. iproute2        - For network statistics (provides 'ss')
+# 4. zenity          - For graphical password prompts
+# 5. coreutils/grep  - Standard Linux utilities
+
+# --- Configuration ---
+ONCE_MODE=false
+if [[ "${1:-}" == "--once" ]]; then
+    ONCE_MODE=true
+    shift
+fi
+
+# If running as root without an argument, default to scanning /home instead of /root/Downloads
+if [[ $EUID -eq 0 && -z "${1:-}" ]]; then # Check original $1 if --once was not used
+    SCAN_TARGET="/home"
+else
+    # Default to Downloads, but fallback to current directory if Downloads doesn't exist 
+    # (Common for system accounts like the 'clamscan' user)
+    DEFAULT_TARGET="${HOME:-/tmp}/Downloads|/home" # Use /tmp if HOME is not set (e.g., systemd service)
+    [[ ! -d "$DEFAULT_TARGET" ]] && DEFAULT_TARGET="."
+    SCAN_TARGET="${1:-$DEFAULT_TARGET}"
+fi
+
+# Directory to move infected files for isolation
+QUARANTINE_DIR="${HOME:-/tmp}/clamav_quarantine"
+
+# Set a default log file if not provided by the environment
+[[ -z "${LOG_FILE:-}" ]] && LOG_FILE="${HOME}/.local/share/netvscan.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/netvscan.log"
+
+# --- UI Colors ---
+RED='\e[1;31m'
+GREEN='\e[1;32m'
+YELLOW='\e[1;33m'
+RESET='\e[0m'
+
+# Logging helper with timestamps
+log_message() {
+    local msg="$1"
+    printf "[%s] %b\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" | tee -a "$LOG_FILE"
+}
+
+# Function to send desktop notifications
+send_alert() {
+    local title="$1"
+    local message="$2"
+    local short_msg=$(echo -e "$message" | head -n 10) # Truncate to prevent daemon crashes
+
+    # 1. Always log to terminal and file first
+    echo -e "${RED}[ALERT] ${title}: ${message}${RESET}" >&2
+    log_message "ALERT: $title - $message"
+
+    # 2. Attempt desktop notification
+    if command -v notify-send &>/dev/null; then
+        # If running as root (or via sudo), we must target the user's session for popups to work
+        if [[ $EUID -eq 0 ]]; then
+            # Attempt to find the user currently logged into the graphical session
+            local real_user="${SUDO_USER:-$(who | awk '($2 ~ /tty[0-9]/ || $2 ~ /:[0-9]/) {print $1; exit}')}"
+            if [[ -n "$real_user" ]]; then
+                local user_id=$(id -u "$real_user")
+                # Standard path for D-Bus on modern systemd-based systems (like NixOS)
+                local dbus_addr="unix:path=/run/user/$user_id/bus"
+                
+                if [[ -S "/run/user/$user_id/bus" ]]; then
+                    # Drop privileges back to the user to send the notification
+                    sudo -u "$real_user" DBUS_SESSION_BUS_ADDRESS="$dbus_addr" \
+                        notify-send -u critical -i "dialog-error" "$title" "$short_msg" 2>/dev/null && return
+                fi
+            fi
+        fi
+
+        # Fallback path for standard users or if session detection failed
+        if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+            notify-send -u critical -i "dialog-error" "$title" "$short_msg" 2>/dev/null
+        fi
+    fi
+}
+
+# Initialize SUDO_EXEC
+SUDO_EXEC=""
+
+# Check for Root privileges
+check_root() {
+    local RUN_DIR="${HOME}/.local/bin/.netvscan_vault"
+    local PASS_FILE="$RUN_DIR/.p"
+    local ASKPASS_PATH="$RUN_DIR/askpass.sh"
+
+    if [[ $EUID -ne 0 ]]; then
+        # 1. Check if we already have passwordless sudo access
+        if sudo -n true 2>/dev/null; then
+            SUDO_EXEC="sudo"
+        # 2. Check for an existing valid vault (allows service restarts without re-prompting)
+        elif [[ -f "$ASKPASS_PATH" && -f "$PASS_FILE" ]]; then
+            export SUDO_ASKPASS="$ASKPASS_PATH"
+            if sudo -A true 2>/dev/null; then
+                SUDO_EXEC="sudo -A"
+                log_message "Authenticated using existing vault."
+                return
+            else
+                log_message "Existing vault authentication failed. Will re-prompt if display is available."
+            fi
+        fi
+
+        # 3. Try graphical popup if a display is available and zenity is installed
+        if [[ -z "$SUDO_EXEC" ]] && [[ -n "${DISPLAY:-}" ]] && command -v zenity &>/dev/null; then
+            local PASS
+            PASS=$(zenity --password --title="NetVScan Security Scanner" --text="Root privileges required for network inspection and virus updates:" 2>/dev/null | tail -n 1)
+            
+            if [[ -n "$PASS" ]]; then
+                # Create a temporary askpass helper to handle the password securely
+                mkdir -p "$RUN_DIR"
+                chmod 700 "$RUN_DIR"
+
+                # Store raw password with a newline for standard compatibility
+                printf "%s\n" "$PASS" > "$PASS_FILE"
+                chmod 600 "$PASS_FILE"
+
+                # Create a simple helper that outputs the stored password
+                printf '#!/usr/bin/env bash\ncat %q\n' "$PASS_FILE" > "$ASKPASS_PATH"
+                chmod 700 "$ASKPASS_PATH"
+
+                export SUDO_ASKPASS="$ASKPASS_PATH"
+                unset PASS # Clear from memory for security
+                
+                # Verify password using the actual askpass mechanism
+                if sudo -A true 2>/dev/null; then
+                    SUDO_EXEC="sudo -A"
+                else
+                    send_alert "Authentication Failed" "Incorrect password entered. Running with limited privileges."
+                    SUDO_EXEC=""
+                fi
+            else
+                SUDO_EXEC=""
+            fi
+        else
+            log_message "Sudo escalation unavailable. Proceeding with limited privileges."
+            SUDO_EXEC=""
+        fi
+    else
+        SUDO_EXEC=""
+    fi
+}
+
+# 1. Check Dependencies
+check_deps() {
+    if ! command -v clamscan &>/dev/null; then
+        echo -e "${YELLOW}Warning: ClamAV (clamscan) not found. File scanning will be skipped.${RESET}"
+        echo "On NixOS, add 'clamav' to environment.systemPackages or use 'nix-shell -p clamav'."
+    fi
+    if ! command -v notify-send &>/dev/null; then
+        echo -e "${YELLOW}Warning: libnotify (notify-send) not found. Popups will not appear.${RESET}"
+    fi
+    if ! command -v ss &>/dev/null; then
+        echo -e "${RED}Error: 'ss' command not found. Network scanning cannot proceed.${RESET}"
+        exit 1
+    fi
+    if ! command -v curl &>/dev/null; then
+        echo -e "${YELLOW}Warning: 'curl' not found. IP reputation checks will be skipped.${RESET}"
+    fi
+}
+
+# 1.5 Update Virus Database
+update_db() {
+    echo -e "${GREEN}Updating ClamAV virus database...${RESET}"
+
+    # On NixOS, the updater is often a systemd service
+    if systemctl is-active --quiet clamav-freshclam 2>/dev/null; then
+        echo "NixOS freshclam service is active. Database is being managed by the system."
+    elif command -v freshclam &>/dev/null; then
+        # Check if we can actually read the config file
+        if [[ -r "/etc/clamav/freshclam.conf" || -n "$SUDO_EXEC" ]]; then
+            echo "Running manual freshclam update..."
+            $SUDO_EXEC freshclam || echo -e "${YELLOW}Note: freshclam failed. The database may be locked or permissions are restricted.${RESET}"
+        else
+            echo -e "${YELLOW}Warning: Cannot read /etc/clamav/freshclam.conf.${RESET}"
+            echo "Updates require root or a local freshclam.conf."
+        fi
+    else
+        echo -e "${YELLOW}Warning: 'freshclam' not found. Skipping update.${RESET}"
+        echo "Suggestion: Enable 'services.clamav.updater.enable = true;' in your NixOS configuration."
+    fi
+}
+
+# 2. File Virus Scan (using ClamAV)
+scan_files() {
+    if [[ ! -d "$SCAN_TARGET" ]]; then
+        echo -e "${YELLOW}Warning: Target directory '$SCAN_TARGET' does not exist. Skipping file scan.${RESET}"
+        log_message "Skipping file scan: '$SCAN_TARGET' not found."
+        return
+    fi
+
+    # Verify current user has read permissions for the target
+    if [[ ! -r "$SCAN_TARGET" ]]; then
+        echo -e "${RED}Error: Cannot read directory '$SCAN_TARGET'. Permission denied.${RESET}"
+        log_message "Skipping file scan: User $(id -u -n) lacks read access to '$SCAN_TARGET'."
+        return
+    fi
+
+    echo -e "${GREEN}Starting file scan on: $SCAN_TARGET...${RESET}"
+    log_message "Starting file scan on: $SCAN_TARGET"
+    
+    # Detect ClamAV database location
+    local DB_PATH=""
+    local SEARCH_PATHS=("/var/lib/clamav" "/usr/local/share/clamav" "/var/db/clamav")
+    
+    for path in "${SEARCH_PATHS[@]}"; do
+        if [[ -d "$path" && ( -f "$path/main.cvd" || -f "$path/main.cld" ) ]]; then
+            DB_PATH="$path"
+            break
+        fi
+    done
+
+    local DB_FLAG=""
+    if [[ -n "$DB_PATH" ]]; then
+        DB_FLAG="-d $DB_PATH"
+    else
+        echo -e "${YELLOW}Warning: Virus database not found in standard locations.${RESET}"
+        echo "Run 'freshclam' or enable the ClamAV updater service."
+    fi
+
+    # Ensure quarantine directory exists
+    mkdir -p "$QUARANTINE_DIR"
+    chmod 700 "$QUARANTINE_DIR"
+
+    # Create a temporary file to capture all clamscan output (stdout and stderr)
+    local CLAMSCAN_OUTPUT_FILE=$(mktemp)
+    
+    # -r: recursive, -i: only print infected files, --move: Isolates infected files
+    # We use $SUDO_EXEC here so it can scan files outside of the user home if needed
+    $SUDO_EXEC clamscan ${DB_FLAG} -r -i --move="$QUARANTINE_DIR" -- "$SCAN_TARGET" &> "$CLAMSCAN_OUTPUT_FILE"
+
+    # Log the full clamscan output
+    log_message "--- Full ClamAV scan output for $SCAN_TARGET ---"
+    if [[ -s "$CLAMSCAN_OUTPUT_FILE" ]]; then
+        # More efficient way to append file content to log with indentation
+        sed 's/^/  /' "$CLAMSCAN_OUTPUT_FILE" >> "$LOG_FILE"
+        cat "$CLAMSCAN_OUTPUT_FILE"
+    fi
+    log_message "--- End ClamAV scan output ---"
+
+    # Check for infected files in the captured output
+    local INFECTED=$(grep "FOUND" "$CLAMSCAN_OUTPUT_FILE")
+
+    if [[ -n "$INFECTED" ]]; then
+        send_alert "Malware Isolated!" "Infected files moved to $QUARANTINE_DIR:\n$INFECTED"
+    else
+        echo "No infected files found."
+        log_message "File scan clean for $SCAN_TARGET"
+    fi
+
+    # Clean up the temporary file
+    rm -f "$CLAMSCAN_OUTPUT_FILE"
+}
+
+# 3. Network Threat Scan (Basic Heuristics)
+scan_network() {
+    echo -e "${GREEN}Scanning network connections...${RESET}"
+    log_message "Scanning network connections"
+
+    # 0. IP Reputation Check
+    if command -v curl &>/dev/null; then
+        local BLOCKLIST_URL="https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
+        local BLOCKLIST_FILE="${HOME}/.local/bin/.netvscan_vault/firehol_level1.txt"
+        
+        # Update list if older than 1 hour
+        if [[ ! -f "$BLOCKLIST_FILE" || $(find "$BLOCKLIST_FILE" -mmin +60) ]]; then
+            curl -sSL "$BLOCKLIST_URL" -o "$BLOCKLIST_FILE" || true
+        fi
+
+        if [[ -f "$BLOCKLIST_FILE" ]]; then
+            # Extract active remote IPs (excluding local/loopback)
+            # sed logic handles both IPv4 and IPv6 (stripping ports and brackets)
+            local ACTIVE_IPS=$($SUDO_EXEC ss -ntuH | awk '{print $5}' | sed 's/:[^:]*$//; s/[][]//g' | grep -vE '^(127\.|0\.0\.0\.0|::1|$)' | sort -u)
+            
+            for ip in $ACTIVE_IPS; do
+                # Check if the exact IP exists in the blocklist
+                if grep -q "^${ip}$" "$BLOCKLIST_FILE"; then
+                    send_alert "Malicious IP Connection!" "Your system is communicating with a known threat: $ip"
+                    # Try to identify the process
+                    local PROC_INFO=$($SUDO_EXEC ss -ntup | grep "$ip")
+                    log_message "Malicious Process Info: $PROC_INFO"
+                fi
+            done
+        fi
+    fi
+
+    # 1. Check for Promiscuous Mode (Network Sniffing)
+    # Legitimate tools like Wireshark use this, but it shouldn't be active otherwise.
+    local PROMISC_INTERFACES=$(ip link show | grep -i "PROMISC" || true)
+    if [[ -n "$PROMISC_INTERFACES" ]]; then
+        send_alert "Network Sniffing Detected" "Interface(s) in promiscuous mode:\n$PROMISC_INTERFACES"
+    fi
+
+    # 2. Check for Raw Sockets
+    # We filter out protocol 1 (ICMP) and 58 (ICMPv6) as these are standard system behaviors.
+    local RAW_SOCKETS=$($SUDO_EXEC ss -raw -n -p 2>/dev/null | \
+        grep -v "State" | \
+        grep -vE "sk:raw:(1|58)|:(1|58)([[:space:]]|$)" | \
+        grep -vE 'users:\(\("(vmnet-natd|NetworkManager)"' || true) # Exclude known legitimate raw socket users
+
+    if [[ -n "$RAW_SOCKETS" ]]; then
+        send_alert "Raw Sockets Active" "Potential low-level network bypass detected:\n$RAW_SOCKETS"
+    fi
+    
+    # 3. Suspicious Port Monitoring
+    # 4444 (Metasploit), 6667 (IRC/Bots), 1337 (Backdoors), 31337 (Elite/Back Orifice)
+    SUSPICIOUS_PORTS="4444|6667|1337|31337"
+    
+    # -a ensures we see LISTEN and ESTABLISHED sockets
+    # Improved regex: looks for the port number followed by a non-digit character, 
+    # whitespace, or the end of the line to avoid matching 44441 etc.
+    local NET_MATCHES=$($SUDO_EXEC ss -atupn 2>/dev/null | grep -v "Local Address" | grep -E ":(${SUSPICIOUS_PORTS})([^0-9]|$)" || true)
+
+    if [[ -n "$NET_MATCHES" ]]; then
+        # Determine if it's a listener or an outgoing connection
+        if echo "$NET_MATCHES" | grep -q "LISTEN"; then
+            send_alert "Inbound Backdoor?" "Process listening on suspicious port:\n$NET_MATCHES"
+        else
+            send_alert "Outbound C2 detected?" "Active connection to suspicious port:\n$NET_MATCHES"
+        fi
+    fi
+
+    if [[ -z "$PROMISC_INTERFACES" && -z "$RAW_SOCKETS" && -z "$NET_MATCHES" ]]; then
+        echo "Network connections look clean."
+        log_message "Network scan clean"
+    fi
+}
+
+# 4. Suspicious Process Scan
+scan_processes() {
+    echo -e "${GREEN}Scanning for suspicious processes...${RESET}"
+    log_message "Scanning processes"
+
+    # Check for processes running from /tmp or /dev/shm (common for payloads)
+    # Added filters to ignore legitimate sandboxing and helper tools on NixOS
+    SUS_PROCS=$(ps aux | grep -E "/tmp/|/dev/shm/" | grep -vE "grep|bwrap|sddm-helper|steamwebhelper|crashpad|flatpak" || true)
+
+    if [[ -n "$SUS_PROCS" ]]; then
+        send_alert "Suspicious Process Detected!" "Processes running from temp directories:\n$SUS_PROCS"
+    else
+        echo "Processes look clean."
+        log_message "Process scan clean"
+    fi
+}
+
+# --- Main Execution ---
+# Only clear if the script is attached to a real terminal (Tty)
+if [[ -t 1 ]]; then
+    clear
+fi
+echo "======================================"
+echo "   Simple Bash Security Automator     "
+echo "======================================"
+check_root
+check_deps
+
+# Start background monitor for network and processes (Fast checks)
+if [[ "$ONCE_MODE" == false ]]; then
+    (
+        while true; do
+            # Redirect stdout to null to keep terminal clean; alerts use stderr
+            scan_network >/dev/null
+            scan_processes >/dev/null
+            sleep 15
+        done
+    ) &
+    MONITOR_PID=$!
+    # Ensure the background monitor is killed when the main script exits
+    trap '[[ -n "${MONITOR_PID:-}" ]] && kill "$MONITOR_PID" 2>/dev/null; exit' INT TERM EXIT
+    log_message "Real-time network and process monitoring started (PID: $MONITOR_PID)."
+fi
+
+# Main loop for slow tasks (ClamAV)
+while true; do
+    update_db
+    scan_files
+
+    if [[ "$ONCE_MODE" == true ]]; then
+        scan_network
+        scan_processes
+        log_message "One-shot scan complete. Exiting."
+        break # Exit the loop if --once was specified
+    fi
+
+    log_message "File scan cycle complete. Next file scan in 10 minutes (monitoring continues)..."
+    # Wait 10 minutes (600 seconds) before the next scan
+    sleep 600
+done
+
+echo "======================================"
+echo "Scan complete. Logs available at $LOG_FILE"
