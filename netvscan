@@ -24,7 +24,7 @@ if [[ $EUID -eq 0 && -z "${1:-}" ]]; then # Check original $1 if --once was not 
 else
     # Default to Downloads, but fallback to current directory if Downloads doesn't exist 
     # (Common for system accounts like the 'clamscan' user)
-    DEFAULT_TARGET="${HOME:-/tmp}/Downloads|/home" # Use /tmp if HOME is not set (e.g., systemd service)
+    DEFAULT_TARGET="${HOME:-/tmp}/Downloads|/Documents|/Pictures|/Videos|/Music|/Public" # Use /tmp if HOME is not set (e.g., systemd service)
     [[ ! -d "$DEFAULT_TARGET" ]] && DEFAULT_TARGET="."
     SCAN_TARGET="${1:-$DEFAULT_TARGET}"
 fi
